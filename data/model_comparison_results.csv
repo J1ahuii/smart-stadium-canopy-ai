@@ -1,0 +1,8 @@
+Model Name,Accuracy (%),ROC-AUC,Rain Precision,Rain Recall,Rain F1
+6. Gradient Boosting (HistGBM),82.99,0.8382,0.561,0.6416,0.5986
+7. Ensemble (RF + HistGBM),83.61,0.8354,0.5823,0.6047,0.5933
+5. Random Forest (250 Trees),84.74,0.8269,0.6353,0.5363,0.5816
+4. Single Decision Tree,79.36,0.7436,0.4817,0.5773,0.5252
+2. Logistic Regression,78.44,0.7405,0.4585,0.4993,0.4781
+1. Linear Regression (LPM benchmark),76.33,0.7251,0.4176,0.4993,0.4548
+3. Gaussian Naive Bayes,82.36,0.657,0.6586,0.2244,0.3347
