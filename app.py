@@ -633,6 +633,7 @@ if "sim_dht_fault" not in st.session_state:
     st.session_state.sim_dht_fault = False
 
 bridge: ESP32HardwareBridge = st.session_state.bridge
+bridge.poll_serial()
 supervisor: SafetySupervisor = st.session_state.supervisor
 logger: TelemetryLogger = st.session_state.logger
 

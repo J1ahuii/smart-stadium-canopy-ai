@@ -1,21 +1,23 @@
-# 硬件抽象接口 & 纯软件模拟器桥梁
+# 硬件抽象接口 & USB串口 / 纯软件模拟器桥梁
 # 严格区分“指令要求位置”与“限位开关/编码器实际确认位置”，未接 ESP32 时绝不虚报物理动作
 # DHT11 连续 3 次读取失败才判定故障
 
-"""Proposed ESP32 IoT Telemetry & Actuator Communication Bridge (Points 2 & 4).
-
-In Software-Only Mode (no physical ESP32 attached), this module cleanly separates
-virtual simulation state from confirmed physical hardware feedback and never falsely
-claims physical motor movement when the actuator controller is disconnected.
-"""
-
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+try:
+    import serial
+    import serial.tools.list_ports
+    PYSERIAL_AVAILABLE = True
+except ImportError:
+    serial = None  # type: ignore
+    PYSERIAL_AVAILABLE = False
 
 from src.config import (
     DEFAULT_ACTUATOR_TIMEOUT_SECONDS,
@@ -82,12 +84,127 @@ class ESP32ActuatorState:
 
 
 class ESP32HardwareBridge:
-    """Manages sensor ingestion, actuator command dispatch, and ACK tracking."""
+    """Manages USB Serial link, sensor ingestion, actuator command dispatch, and ACK tracking."""
 
-    def __init__(self) -> None:
+    def __init__(self, baudrate: int = 115200) -> None:
         self.sensors = ESP32SensorState()
         self.actuator = ESP32ActuatorState()
         self.simulated_canopy_pct: float = 0.0
+
+        # USB Serial transport state
+        self.baudrate: int = baudrate
+        self.serial_port_name: Optional[str] = None
+        self._ser = None
+        self._rx_buffer: str = ""
+        self._last_scan_epoch: float = 0.0
+
+    @staticmethod
+    def list_available_ports() -> List[str]:
+        """Return list of available serial COM ports on this PC."""
+        if not PYSERIAL_AVAILABLE:
+            return []
+        return [p.device for p in serial.tools.list_ports.comports()]
+
+    def _find_esp32_port(self) -> Optional[str]:
+        """Auto-detect common ESP32 USB-UART bridges (CP210x, CH340, FTDI, Espressif)."""
+        if not PYSERIAL_AVAILABLE:
+            return None
+        ports = list(serial.tools.list_ports.comports())
+        keywords = ("cp210", "ch340", "ch910", "ftdi", "usb serial", "uart", "espressif", "jtag")
+        for p in ports:
+            desc = f"{p.description} {p.manufacturer or ''}".lower()
+            if any(k in desc for k in keywords):
+                return p.device
+        return ports[0].device if len(ports) == 1 else None
+
+    def connect_serial(self, port: Optional[str] = None) -> bool:
+        """Open non-blocking USB Serial connection to ESP32."""
+        if not PYSERIAL_AVAILABLE:
+            return False
+        if self._ser is not None and getattr(self._ser, "is_open", False):
+            return True
+
+        target_port = port or self._find_esp32_port()
+        if not target_port:
+            return False
+
+        try:
+            self._ser = serial.Serial(target_port, self.baudrate, timeout=0, write_timeout=0.5)
+            self.serial_port_name = target_port
+            self._rx_buffer = ""
+            return True
+        except Exception:
+            self._ser = None
+            self.serial_port_name = None
+            return False
+
+    def disconnect_serial(self) -> None:
+        """Close USB Serial port cleanly."""
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+        self._ser = None
+        self.serial_port_name = None
+        self.sensors.connected = False
+        self.actuator.connected = False
+
+    def poll_serial(self, preferred_port: Optional[str] = None) -> int:
+        """Read all pending JSON telemetry lines from ESP32 over USB Serial."""
+        if not PYSERIAL_AVAILABLE:
+            return 0
+
+        # Auto-connect every 2 seconds if unplugged
+        if self._ser is None or not getattr(self._ser, "is_open", False):
+            now = time.time()
+            if now - self._last_scan_epoch >= 2.0:
+                self._last_scan_epoch = now
+                self.connect_serial(preferred_port)
+            if self._ser is None:
+                return 0
+
+        packets_read = 0
+        try:
+            waiting = self._ser.in_waiting
+            if waiting > 0:
+                raw = self._ser.read(waiting).decode("utf-8", errors="ignore")
+                self._rx_buffer += raw
+                while "\n" in self._rx_buffer:
+                    line, self._rx_buffer = self._rx_buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        data = json.loads(line)
+                        self.ingest_sensor_payload(data)
+                        self.ingest_actuator_ack(data)
+                        packets_read += 1
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            self.disconnect_serial()
+            return packets_read
+
+        if self.sensors.connected and self.sensors.is_stale():
+            self.sensors.connected = False
+            self.actuator.connected = False
+
+        self.check_ack_timeout()
+        return packets_read
+
+    def _send_serial_json(self, payload: Dict) -> bool:
+        """Transmit JSON command line to ESP32 over USB Serial."""
+        if self._ser is None or not getattr(self._ser, "is_open", False):
+            return False
+        try:
+            msg = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+            self._ser.write(msg)
+            self._ser.flush()
+            return True
+        except Exception:
+            self.disconnect_serial()
+            return False
 
     def ingest_sensor_payload(self, payload: Dict) -> None:
         """Process JSON telemetry packet from ESP32 sensor node (or bench simulator)."""
@@ -157,7 +274,7 @@ class ESP32HardwareBridge:
         allow_physical_actuation: bool,
         virtual_hardware_loopback: bool = False,
     ) -> ActuatorCommand:
-        """Issue tracked movement command or update simulation state safely."""
+        """Issue tracked movement command over USB Serial or update simulation state safely."""
         cmd_id = str(uuid.uuid4())[:8].upper()
         now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         target = round(float(max(0.0, min(100.0, target_position_pct))), 1)
@@ -181,6 +298,15 @@ class ESP32HardwareBridge:
                         "actuator_fault": False,
                     }
                 )
+            else:
+                self._send_serial_json(
+                    {
+                        "cmd": action,
+                        "command_id": cmd_id,
+                        "target_pos": target,
+                    }
+                )
+
             return ActuatorCommand(
                 command_id=cmd_id,
                 action=action,
